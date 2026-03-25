@@ -844,59 +844,118 @@ def load_validation_tokens(pattern: str, seq_len: int) -> np.ndarray:
 
 def eval_val(
     args: Hyperparameters,
-    compiled_loss,
     val_tokens: np.ndarray,
     base_bytes_lut: np.ndarray,
     has_leading_space_lut: np.ndarray,
     is_boundary_token_lut: np.ndarray,
-    log_fn: Callable[[str], None] | None = None,
+    student_model:GPT,
+    log_fn=None,
 ) -> tuple[float, float]:
-    val_batch_tokens = args.val_batch_size // args.grad_accum_steps
-    if val_batch_tokens < args.train_seq_len:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, "
-            f"GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
-            f"TRAIN_SEQ_LEN={args.train_seq_len}"
-        )
-    val_batch_seqs = val_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.size - 1) // args.train_seq_len
-    total_batches = max((total_seqs + val_batch_seqs - 1) // val_batch_seqs, 1)
+    """
+    Sliding window evaluation.
+    Instead of scoring each 1024-token chunk independently,
+    we slide by `stride` tokens each step.
+    Every token gets evaluated with MAXIMUM available context.
+    This gives much better BPB because the model sees more context.
+    """
+
+    stride = 64                   # score 64 new tokens per window
+    window = args.train_seq_len   # 1024 context window
+
+    total_tokens = val_tokens.size - 1
     total_loss_sum = 0.0
-    total_tokens = 0.0
+    total_token_count = 0.0
     total_bytes = 0.0
-    for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
-        batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
-        raw_start = batch_seq_start * args.train_seq_len
-        raw_end = batch_seq_end * args.train_seq_len + 1
-        chunk = val_tokens[raw_start:raw_end]
-        x_np = chunk[:-1].reshape(-1, args.train_seq_len)
-        y_np = chunk[1:].reshape(-1, args.train_seq_len)
+
+    # How many sliding steps total
+    total_steps = max((total_tokens - window) // stride, 1)
+    log_every = max(total_steps // 10, 1)
+
+    pos = 0
+    step_idx = 0
+
+    while pos < total_tokens:
+
+        # ── Figure out window boundaries ──────────────────────
+        # ctx_start: where context begins
+        # ctx_end:   where context ends (exclusive)
+        ctx_start = max(0, pos - window + stride)
+        ctx_end   = min(pos + stride, total_tokens)
+
+        if ctx_end - ctx_start < 2:
+            pos += stride
+            continue
+
+        # ── Load chunk ────────────────────────────────────────
+        chunk = val_tokens[ctx_start : ctx_end + 1]
+        x_np = chunk[:-1].reshape(1, -1)   # [1, seq_len]
+        y_np = chunk[1:].reshape(1, -1)    # [1, seq_len]
+
         x = mx.array(x_np, dtype=mx.int32)
         y = mx.array(y_np, dtype=mx.int32)
-        chunk_token_count = float(y.size)
-        batch_loss = compiled_loss(x, y).astype(mx.float32)
-        mx.eval(batch_loss)
-        total_loss_sum += float(batch_loss.item()) * chunk_token_count
-        prev_ids = x_np.reshape(-1)
-        tgt_ids = y_np.reshape(-1)
-        bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
-        bytes_np += (
-            has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
-        ).astype(np.int16, copy=False)
-        total_tokens += chunk_token_count
-        total_bytes += float(bytes_np.astype(np.float64).sum())
-        if log_fn is not None and total_batches > 1 and (
-            batch_idx == 1
-            or batch_idx == total_batches
-            or batch_idx % 25 == 0
-        ):
-            log_fn(f"val_progress:{batch_idx}/{total_batches}")
-    val_loss = total_loss_sum / total_tokens
-    bits_per_token = val_loss / math.log(2.0)
-    val_bpb = bits_per_token * (total_tokens / total_bytes)
-    return val_loss, val_bpb
 
+        # ── Get per-token loss ────────────────────────────────
+        # We need per-token loss, not mean
+        # So we call the model manually here
+        # instead of using compiled_loss_fn (which returns mean)
+        seq_len = x_np.shape[1]
+
+        # How many tokens are context only (not scored)
+        score_start = pos - ctx_start
+        # Tokens from score_start onwards are the NEW tokens we score
+        # Tokens before score_start are just context
+
+        if score_start >= seq_len:
+            pos += stride
+            continue
+
+        # Get logits from model
+        hidden = student_model(x)                              # [1, seq_len, dim]
+        hidden_flat = hidden.reshape(-1, hidden.shape[-1])  # [seq_len, dim]
+        logits_proj = hidden_flat @ student_model.tok_emb.weight.astype(hidden_flat.dtype).T
+        logits = student_model.softcap(logits_proj).astype(mx.float32)  # [seq_len, vocab]
+
+        targets_flat = y.reshape(-1)                   # [seq_len]
+
+        # Per-token cross entropy
+        # MLX cross_entropy with reduction="none" gives per-token loss
+        per_token_loss = nn.losses.cross_entropy(
+            logits,
+            targets_flat,
+            reduction="none",
+        )  # [seq_len]
+
+        mx.eval(per_token_loss)
+
+        # ── Only score the NEW tokens ─────────────────────────
+        scored_loss    = np.array(per_token_loss[score_start:].astype(mx.float32))
+        scored_targets = y_np.reshape(-1)[score_start:]
+        scored_prev    = x_np.reshape(-1)[score_start:]
+
+        n_scored = scored_loss.size
+        if n_scored > 0:
+            total_loss_sum    += float(scored_loss.sum())
+            total_token_count += n_scored
+
+            bytes_np  = base_bytes_lut[scored_targets].astype(np.int16, copy=True)
+            bytes_np += (
+                has_leading_space_lut[scored_targets] &
+                ~is_boundary_token_lut[scored_prev]
+            ).astype(np.int16)
+            total_bytes += float(bytes_np.astype(np.float64).sum())
+
+        # ── Logging progress ──────────────────────────────────
+        step_idx += 1
+        if log_fn is not None and step_idx % log_every == 0:
+            log_fn(f"val_progress:{step_idx}/{total_steps}")
+
+        pos += stride
+
+    val_loss = total_loss_sum / max(total_token_count, 1)
+    bits_per_token = val_loss / math.log(2.0)
+    val_bpb = bits_per_token * (total_token_count / max(total_bytes, 1))
+
+    return val_loss, val_bpb
 
 # ==============================================================================
 # GRADIENT CLIPPING
@@ -929,7 +988,6 @@ def distill_step(
     model: GPT,
     compiled_teacher_forward,
     compiled_teacher_loss_and_grad,
-    compiled_loss_and_grad,
 ) -> tuple[mx.array, mx.array, dict, dict]:
     """
     One complete distillation step over the full train_batch_tokens.
@@ -1217,7 +1275,6 @@ def main() -> None:
                 model,
                 compiled_teacher_forward,
                 compiled_teacher_loss_and_grad,
-                compiled_loss_and_grad,
             )
             mx.eval(s_wloss)
             mx.synchronize()
@@ -1281,11 +1338,11 @@ def main() -> None:
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
                 args,
-                compiled_loss,
                 val_tokens,
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
+                student_model=model,
                 log_fn=log,
             )
             if step % 25 == 0 or last_step:
@@ -1322,7 +1379,6 @@ def main() -> None:
             model,
             compiled_teacher_forward,
             compiled_teacher_loss_and_grad,
-            compiled_loss_and_grad,
         )
 
         if args.mlx_eager_eval:
@@ -1403,11 +1459,11 @@ def main() -> None:
     q_t0 = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
-        compiled_loss,
         val_tokens,
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
+        student_model=model,
         log_fn=log,
     )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
