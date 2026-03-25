@@ -970,7 +970,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_teacher)
-    compiled_teacher = torch.compile(base_teacher, dynamic=False, fullgraph=True)
+    compiled_teacher = base_teacher
     teacher: nn.Module = DDP(compiled_teacher, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_teacher
 
     # ── STUDENT model (smaller, gets quantized and submitted) ──────────────────
@@ -992,7 +992,7 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     student_wrapper = DistillWrapper(base_model)
-    compiled_model = torch.compile(student_wrapper, dynamic=False, fullgraph=True)
+    compiled_model = student_wrapper
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # ── Optimizers ─────────────────────────────────────────────────────────────
