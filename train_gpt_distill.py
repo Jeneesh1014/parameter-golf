@@ -804,7 +804,7 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
-    with torch.inference_mode():
+    with torch.no_grad():
         pos = seq_start
         while pos < seq_end:
             # Figure out the window
@@ -1047,7 +1047,7 @@ def main() -> None:
                 (t_loss * grad_scale).backward()
 
                 # Get teacher logits (no grad)
-                with torch.inference_mode():
+                with torch.no_grad():
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                         t_logits = base_teacher.forward_logits(x).float().detach()
 
@@ -1143,7 +1143,7 @@ def main() -> None:
             (t_loss * grad_scale).backward()
 
             # ── TEACHER LOGITS: extract soft predictions (no grad) ──────────
-            with torch.inference_mode():
+            with torch.no_grad():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     t_logits = base_teacher.forward_logits(x).float().detach()
             # .detach() + inference_mode: student loss cannot flow into teacher
